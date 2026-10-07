@@ -1,0 +1,379 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17.11
+        env:
+          POSTGRES_USER: accesslobby
+          POSTGRES_PASSWORD: test-only-password
+          POSTGRES_DB: accesslobby
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U accesslobby -d accesslobby"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      DATABASE_URL: postgres://accesslobby:test-only-password@127.0.0.1:5432/accesslobby
+      TEST_DATABASE_URL: postgres://accesslobby:test-only-password@127.0.0.1:5432/accesslobby
+      NEXT_TELEMETRY_DISABLED: 1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.19.0'
+      - name: Install pnpm
+        run: npm install -g pnpm@11.19.0
+      - run: pnpm install --frozen-lockfile
+      - run: python3 -m unittest discover -s infra/scripts -p 'test_*.py'
+      - run: node --test infra/scripts/private-client-token.test.mjs
+      - run: pnpm audit --prod --audit-level high
+      - run: pnpm --filter @accesslobby/api migrate
+      - run: pnpm typecheck
+      - run: pnpm test
+      - run: pnpm build
+      - name: Install Chromium for installed-PWA smoke
+        run: pnpm exec playwright install --with-deps chromium
+      - name: Verify refined production UI and native account actions
+        run: node infra/scripts/ui-browser-smoke.mjs
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: accesslobby-ui-refinement
+          path: artifacts/ui-refinement/
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Verify production PWA offline and update lifecycle
+        run: node infra/scripts/pwa-browser-smoke.mjs
+      - name: Verify Enben Notes browser story and responsive forms
+        run: node infra/scripts/enben-browser-smoke.mjs
+      - name: Validate Dokploy Compose configuration
+        env:
+          IAM_DB_PASSWORD: ci-iam-password
+          IDENTITY_DB_PASSWORD: ci-identity-password
+          IAM_ADMIN_USERNAME: ci-admin
+          IAM_ADMIN_PASSWORD: ci-admin-password
+          IAM_PUBLIC_ORIGIN: https://iam.example.test
+          OIDC_ISSUER: https://iam.example.test/realms/accesslobby-first-party
+          WEB_BASE_URL: https://web.example.test
+          ALLOWED_CLIENT_IDS: accesslobby-web
+          SESSION_SECRET: ci-only-placeholder
+          PUBLIC_REGISTRATION_ENABLED: "false"
+          IAM_VERIFY_EMAIL: "false"
+          IAM_RESET_PASSWORD_ENABLED: "false"
+          IAM_IMAGE: ghcr.io/example/iam@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          API_IMAGE: ghcr.io/example/api@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          WEB_IMAGE: ghcr.io/example/web@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          IAM_GATEWAY_IMAGE: ghcr.io/example/iam-gateway@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          GIT_SHA: 0000000000000000000000000000000000000000
+        run: |
+          docker compose -f compose.dokploy.yaml config --format json > /tmp/accesslobby-compose.json
+          python3 - <<'PY'
+          import json
+          with open('/tmp/accesslobby-compose.json') as source:
+              config = json.load(source)
+          assert set(config['networks']) == {'backend', 'iam-edge'}, 'No shared proxy network belongs in source Compose'
+          assert all(network['internal'] for network in config['networks'].values())
+          expected = {
+              'iam-db': {'backend'}, 'identity-db': {'backend'},
+              'iam': {'backend', 'iam-edge'}, 'iam-config': {'backend'},
+              'iam-gateway': {'iam-edge'}, 'migrate': {'backend'},
+              'api': {'backend'}, 'web': {'backend'},
+          }
+          assert set(config['services']) == set(expected)
+          for name, service in config['services'].items():
+              assert not service.get('ports'), f'{name} publishes a host port'
+              assert set(service.get('networks', {})) == expected[name], f'{name} has an unexpected network'
+          assert config['services']['iam']['image'].startswith('ghcr.io/example/iam@sha256:')
+          assert config['services']['iam-config']['image'] == config['services']['iam']['image']
+          web_environment = config['services']['web']['environment']
+          assert web_environment['HOSTNAME'] == '0.0.0.0', 'Web must bind every container interface'
+          assert str(web_environment['PORT']) == '3000', 'Web must listen on the routed container port'
+          assert str(web_environment['PUBLIC_REGISTRATION_ENABLED']).lower() == 'false'
+          iam_config = config['services']['iam-config']['environment']
+          assert iam_config['IAM_LOGIN_THEME'] == 'accesslobby'
+          assert iam_config['IAM_DISPLAY_NAME'] == 'AccessLobby'
+          assert str(iam_config['PUBLIC_REGISTRATION_ENABLED']).lower() == 'false'
+          assert str(iam_config['IAM_VERIFY_EMAIL']).lower() == 'false'
+          assert str(iam_config['IAM_RESET_PASSWORD_ENABLED']).lower() == 'false'
+          print('Branded IAM reconciles privately; web binds all interfaces; source Compose has no shared network or host ports')
+          PY
+          export CONSUMER_IMAGE=ghcr.io/example/reference-consumer@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          export CONSUMER_ORIGIN=https://consumer.example.test
+          export ACCESSLOBBY_API_URL=https://api.example.test
+          docker compose -f compose.consumer.dokploy.yaml config --format json > /tmp/accesslobby-consumer-legacy.json
+          OIDC_CLIENT_ID=staging-open-fixture APP_ENTRY_REQUIRED=true \
+            docker compose -f compose.consumer.dokploy.yaml config --format json > /tmp/accesslobby-consumer-entry.json
+          python3 - <<'PY'
+          import json
+          for path, expected_client, expected_entry in (
+              ('/tmp/accesslobby-consumer-legacy.json', 'reference-consumer', 'false'),
+              ('/tmp/accesslobby-consumer-entry.json', 'staging-open-fixture', 'true'),
+          ):
+              with open(path) as source:
+                  config = json.load(source)
+              assert set(config['services']) == {'consumer'}
+              consumer = config['services']['consumer']
+              assert not consumer.get('ports'), 'Consumer must not publish a host port'
+              env = consumer['environment']
+              assert env['OIDC_CLIENT_ID'] == expected_client
+              assert str(env['APP_ENTRY_REQUIRED']).lower() == expected_entry
+              assert env['GRANTED_PERSON_IDS'] == ''
+          print('Consumer Compose preserves the legacy default and permits an isolated app-entry fixture')
+          PY
+          docker compose -f compose.enben-staging.dokploy.yaml config --format json > /tmp/enben-compose.json
+          python3 - <<'PY'
+          import json
+          config = json.load(open('/tmp/enben-compose.json'))
+          assert set(config['services']) == {'consumer'}
+          peer = config['services']['consumer']
+          assert not peer.get('ports')
+          env = peer['environment']
+          assert env['CONSUMER_ORIGIN'] == 'https://enben.realjanelove.com'
+          assert env['OIDC_CLIENT_ID'] == 'enben-staging-open'
+          assert env['NOTES_ENABLED'] == env['APP_ENTRY_REQUIRED'] == 'true'
+          assert env['PUBLIC_REGISTRATION_ENABLED'] == 'false'
+          assert not env['GRANTED_PERSON_IDS']
+          print('Enben is separate, requires app entry and keeps resource ownership inside the peer')
+          PY
+      - name: Check forbidden source material and secrets
+        run: |
+          forbidden=$(git ls-files | grep -Ei '(^|/)(project_sources|evidence|generated)/|\.env($|\.)|\.dump$|source.pack|conversation.archive' | grep -Ev '(^|/)\.env\.example$' || true)
+          if [ -n "$forbidden" ]; then
+            echo 'Forbidden source material or environment file tracked'; exit 1
+          fi
+      - name: Container builds
+        run: |
+          docker build -f apps/api/Dockerfile -t accesslobby-api:ci .
+          docker build -f apps/web/Dockerfile -t accesslobby-web:ci .
+          docker build -f infra/keycloak/Dockerfile -t accesslobby-iam:ci .
+          docker build -f infra/iam-gateway/Dockerfile -t accesslobby-iam-gateway:ci .
+          docker build -f examples/reference-consumer/Dockerfile -t accesslobby-reference-consumer:ci .
+      - name: Verify web is reachable across a secondary container network
+        run: |
+          docker network create accesslobby-ci-backend
+          docker network create accesslobby-ci-proxy
+          docker run -d --name accesslobby-ci-web --network accesslobby-ci-backend \
+            -e HOSTNAME=0.0.0.0 \
+            -e PORT=3000 \
+            -e WEB_BASE_URL=https://web.example.test \
+            -e OIDC_ISSUER=https://iam.example.test/realms/accesslobby-first-party \
+            -e OIDC_CLIENT_ID=accesslobby-web \
+            -e SESSION_SECRET=ci-only-placeholder \
+            -e API_INTERNAL_URL=http://api:3001 \
+            -e PUBLIC_REGISTRATION_ENABLED=false \
+            accesslobby-web:ci
+          docker network connect accesslobby-ci-proxy accesslobby-ci-web
+          for attempt in $(seq 1 20); do
+            if docker run --rm --network accesslobby-ci-proxy curlimages/curl:8.16.0 \
+              --silent --fail http://accesslobby-ci-web:3000/ > /tmp/accesslobby-web.html; then
+              break
+            fi
+            sleep 1
+          done
+          grep -q 'AccessLobby' /tmp/accesslobby-web.html
+          grep -q 'Access is currently by invitation.' /tmp/accesslobby-web.html
+          ! grep -Eq '>(Create an account|Create account)<' /tmp/accesslobby-web.html
+      - name: Check reference consumer behind an HTTPS proxy
+        run: |
+          docker run -d --name accesslobby-ci-consumer -p 127.0.0.1:14000:4000 \
+            -e CONSUMER_ORIGIN=https://consumer.example.test \
+            -e OIDC_ISSUER=https://iam.example.test/realms/accesslobby-first-party \
+            -e OIDC_CLIENT_ID=reference-consumer \
+            -e ACCESSLOBBY_API_URL=https://api.example.test \
+            -e PUBLIC_REGISTRATION_ENABLED=false \
+            accesslobby-reference-consumer:ci
+          for attempt in $(seq 1 10); do
+            if curl --silent --fail http://127.0.0.1:14000/ -o /tmp/reference-consumer.html; then break; fi
+            sleep 1
+          done
+          grep -q 'AccessLobby reference app' /tmp/reference-consumer.html
+          grep -q 'Sign in to the reference app' /tmp/reference-consumer.html
+          test "$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:14000/private)" = 401
+          test "$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:14000/register)" = 404
+          test "$(curl -sS -o /tmp/bad-consumer-callback -w '%{http_code}' 'http://127.0.0.1:14000/callback?state=invalid&code=invalid')" = 400
+          grep -q 'We could not complete sign-in' /tmp/bad-consumer-callback
+  iam-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:17.11
+        env:
+          POSTGRES_USER: accesslobby
+          POSTGRES_PASSWORD: test-only-password
+          POSTGRES_DB: accesslobby_iam_lifecycle
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U accesslobby -d accesslobby_iam_lifecycle"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.19.0'
+      - name: Build branded IAM image
+        run: docker build -f infra/keycloak/Dockerfile -t accesslobby-iam:ci .
+      - name: Render local realm and start IAM
+        env:
+          WEB_BASE_URL: http://localhost:3000
+          API_PUBLIC_ORIGIN: http://localhost:3001
+        run: |
+          python3 infra/scripts/render-realm.py
+          python3 infra/scripts/render-client.py --client-id reference-consumer \
+            --redirect-uri http://localhost:4000/callback \
+            --logout-uri http://localhost:4000/ \
+            --backchannel-logout-uri http://localhost:4000/backchannel-logout \
+            --output infra/keycloak/generated/reference-consumer.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          realm = Path('infra/keycloak/generated/accesslobby-first-party-realm.json')
+          client = Path('infra/keycloak/generated/reference-consumer.json')
+          data = json.loads(realm.read_text())
+          data['clients'].append(json.loads(client.read_text()))
+          realm.write_text(json.dumps(data))
+          client.unlink()
+          PY
+          docker run -d --name accesslobby-ci-iam -p 127.0.0.1:8080:8080 \
+            -v "$PWD/infra/keycloak/generated:/opt/keycloak/data/import:ro" \
+            -e KC_BOOTSTRAP_ADMIN_USERNAME=ci-admin \
+            -e KC_BOOTSTRAP_ADMIN_PASSWORD=ci-admin-password \
+            -e KC_PROXY_HEADERS=xforwarded \
+            accesslobby-iam:ci start-dev --import-realm
+      - name: Verify discovery and JWKS
+        run: |
+          for attempt in $(seq 1 60); do
+            if curl --silent --fail http://localhost:8080/realms/accesslobby-first-party/.well-known/openid-configuration -o /tmp/discovery.json; then break; fi
+            sleep 2
+          done
+          python3 - <<'PY'
+          import json, urllib.request
+          doc = json.load(open('/tmp/discovery.json'))
+          assert doc['issuer'] == 'http://localhost:8080/realms/accesslobby-first-party'
+          keys = json.load(urllib.request.urlopen(doc['jwks_uri']))['keys']
+          assert keys and any(key['kty'] == 'RSA' for key in keys)
+          print('Exact issuer and signing keys verified')
+          PY
+      - name: Reconcile and verify an existing realm
+        run: |
+          docker run --rm --network host \
+            -v "$PWD/infra/keycloak/reconcile-realm.sh:/opt/accesslobby/reconcile-realm.sh:ro" \
+            -e IAM_INTERNAL_URL=http://127.0.0.1:8080 \
+            -e IAM_REALM=accesslobby-first-party \
+            -e IAM_ADMIN_USERNAME=ci-admin \
+            -e IAM_ADMIN_PASSWORD=ci-admin-password \
+            -e IAM_LOGIN_THEME=accesslobby \
+            -e IAM_DISPLAY_NAME=AccessLobby \
+            -e PUBLIC_REGISTRATION_ENABLED=true \
+            -e IAM_VERIFY_EMAIL=false \
+            -e IAM_RESET_PASSWORD_ENABLED=true \
+            --entrypoint /bin/bash \
+            accesslobby-iam:ci /opt/accesslobby/reconcile-realm.sh
+          docker exec accesslobby-ci-iam /opt/keycloak/bin/kcadm.sh config credentials \
+            --server http://127.0.0.1:8080 --realm master --user ci-admin --password ci-admin-password
+          docker exec accesslobby-ci-iam /opt/keycloak/bin/kcadm.sh get realms/accesslobby-first-party > /tmp/reconciled-realm.json
+          python3 - <<'PY'
+          import json
+          data = json.load(open('/tmp/reconciled-realm.json'))
+          assert data['displayName'] == 'AccessLobby'
+          assert data['displayNameHtml'] == 'AccessLobby'
+          assert data['loginTheme'] == 'accesslobby'
+          assert data['registrationAllowed'] is True
+          assert data['verifyEmail'] is False
+          assert data['resetPasswordAllowed'] is True
+          assert data['loginWithEmailAllowed'] is True
+          assert data['duplicateEmailsAllowed'] is False
+          assert data['bruteForceProtected'] is True
+          print('Existing realm branding, registration and recovery settings reconciled')
+          PY
+      - name: Check branded pages and exact callback registration
+        run: |
+          issuer=http://localhost:8080/realms/accesslobby-first-party
+          good=$(curl -sS -o /tmp/good-login -w '%{http_code}' -G "$issuer/protocol/openid-connect/auth" \
+            --data-urlencode client_id=reference-consumer \
+            --data-urlencode redirect_uri=http://localhost:4000/callback \
+            --data-urlencode response_type=code --data-urlencode scope=openid \
+            --data-urlencode code_challenge_method=S256 \
+            --data-urlencode code_challenge=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA)
+          register=$(curl -sS -o /tmp/register-login -w '%{http_code}' -G "$issuer/protocol/openid-connect/auth" \
+            --data-urlencode client_id=reference-consumer \
+            --data-urlencode redirect_uri=http://localhost:4000/callback \
+            --data-urlencode response_type=code --data-urlencode scope=openid \
+            --data-urlencode prompt=create \
+            --data-urlencode code_challenge_method=S256 \
+            --data-urlencode code_challenge=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA)
+          bad=$(curl -sS -o /tmp/bad-login -w '%{http_code}' -G "$issuer/protocol/openid-connect/auth" \
+            --data-urlencode client_id=reference-consumer \
+            --data-urlencode redirect_uri=http://localhost:4000/unregistered \
+            --data-urlencode response_type=code --data-urlencode scope=openid \
+            --data-urlencode code_challenge_method=S256 \
+            --data-urlencode code_challenge=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA)
+          test "$good" = 200
+          grep -q 'Sign in to AccessLobby' /tmp/good-login
+          grep -q 'accesslobby.css' /tmp/good-login
+          ! grep -q 'ACCESSLOBBY-FIRST-PARTY' /tmp/good-login
+          test "$register" = 200
+          grep -q 'Create your AccessLobby account' /tmp/register-login
+          ! grep -q 'ACCESSLOBBY-FIRST-PARTY' /tmp/register-login
+          test "$bad" = 400
+      - name: Exercise private app client helpers against Keycloak
+        env:
+          CI: 'true'
+          DATABASE_URL: postgres://accesslobby:test-only-password@127.0.0.1:5432/accesslobby_iam_lifecycle
+          IAM_LIFECYCLE_DATABASE_URL: postgres://accesslobby:test-only-password@127.0.0.1:5432/accesslobby_iam_lifecycle
+        run: |
+          npm install -g pnpm@11.19.0
+          pnpm install --frozen-lockfile
+          pnpm --filter @accesslobby/api build
+          pnpm --filter @accesslobby/api migrate
+          pnpm exec playwright install --with-deps chromium
+          IAM_SMOKE_TOKEN=$(curl --fail --silent --show-error \
+            -d grant_type=password -d client_id=admin-cli \
+            -d username=ci-admin -d password=ci-admin-password \
+            http://127.0.0.1:8080/realms/master/protocol/openid-connect/token \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')
+          export IAM_SMOKE_TOKEN
+          node apps/api/test/iam-live-smoke.mjs
+          node apps/api/test/app-onboarding-live-smoke.mjs
+          unset IAM_SMOKE_TOKEN
+      - name: Verify public IAM gateway path and proxy headers
+        run: |
+          docker build -f infra/iam-gateway/Dockerfile -t accesslobby-iam-gateway:ci .
+          docker network create accesslobby-ci
+          docker network connect --alias iam accesslobby-ci accesslobby-ci-iam
+          docker run -d --name accesslobby-ci-gateway --network accesslobby-ci \
+            -p 127.0.0.1:8081:8080 accesslobby-iam-gateway:ci
+          for attempt in $(seq 1 20); do
+            if curl -sS -o /tmp/gateway-discovery -w '%{http_code}' \
+              http://localhost:8081/realms/accesslobby-first-party/.well-known/openid-configuration \
+              -H 'Host: iam.example.test' -H 'X-Forwarded-Proto: http' \
+              -H 'X-Forwarded-Host: spoof.example.test' | grep -qx 200; then break; fi
+            sleep 1
+          done
+          if [ ! -s /tmp/gateway-discovery ]; then
+            docker logs accesslobby-ci-gateway
+            exit 1
+          fi
+          python3 - <<'PY'
+          import json
+          with open('/tmp/gateway-discovery') as source:
+              doc = json.load(source)
+          assert doc['issuer'] == 'https://iam.example.test/realms/accesslobby-first-party'
+          PY
+          for path in / /admin/ /realms/master/ /metrics /health \
+            /realms/accesslobby-first-party/../master/ \
+            /realms/accesslobby-first-party%2f..%2fmaster/; do
+            status=$(curl --path-as-is -sS -o /dev/null -w '%{http_code}' \
+              "http://localhost:8081$path" -H 'Host: iam.example.test')
+            case "$status" in
+              400|403|404) ;;
+              *) echo "Unexpected IAM path $path: $status"; exit 1 ;;
+            esac
+          done

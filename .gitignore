@@ -1,0 +1,12 @@
+node_modules/
+.next/
+dist/
+*.tsbuildinfo
+.env
+.env.*
+!.env.example
+infra/keycloak/generated/
+*.dump
+*.sql.gz
+__pycache__/
+artifacts/
