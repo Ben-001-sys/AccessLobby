@@ -30,7 +30,7 @@ jobs:
           context: .
           file: infra/keycloak/Dockerfile
           push: true
-          tags: ghcr.io/wb-devworld/accesslobby-iam:sha-${{ github.event.workflow_run.head_sha }}
+          tags: ghcr.io/ben-001-sys/accesslobby-iam:sha-${{ github.event.workflow_run.head_sha }}
       - name: Record immutable IAM image reference
         run: |
-          echo "IAM: ghcr.io/wb-devworld/accesslobby-iam@${{ steps.iam.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "IAM: ghcr.io/ben-001-sys/accesslobby-iam@${{ steps.iam.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"
